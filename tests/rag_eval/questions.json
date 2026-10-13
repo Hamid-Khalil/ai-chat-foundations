@@ -1,0 +1,94 @@
+{
+  "questions": [
+    {
+      "question": "How many days of paid leave do full-time employees receive?",
+      "expected_document": "employee-handbook.md",
+      "must_contain": "27 business days"
+    },
+    {
+      "question": "What is the lodging expense ceiling per night in standard municipalities?",
+      "expected_document": "employee-handbook.md",
+      "must_contain": "210 EUR"
+    },
+    {
+      "question": "What is the minimum character length required for user passwords?",
+      "expected_document": "it-security-policy.md",
+      "must_contain": "16"
+    },
+    {
+      "question": "How many failed login attempts trigger an account lockout?",
+      "expected_document": "it-security-policy.md",
+      "must_contain": "5"
+    },
+    {
+      "question": "How many projects are allowed on the Professional plan?",
+      "expected_document": "product-faq.md",
+      "must_contain": "25"
+    },
+    {
+      "question": "What is the webhook retry policy for failed delivery attempts?",
+      "expected_document": "product-faq.md",
+      "must_contain": "5 retries"
+    },
+    {
+      "question": "How much is the hardware stipend allocated for external contractors?",
+      "expected_document": "onboarding-guide.md",
+      "must_contain": "450 EUR"
+    },
+    {
+      "question": "How many days must contractors give as advance notice prior to taking leave?",
+      "expected_document": "onboarding-guide.md",
+      "must_contain": "10 business days"
+    },
+    {
+      "question": "What is the cryptographic TTL for bulk asset export tokens?",
+      "expected_document": "product-faq.md",
+      "must_contain": "43,200 seconds"
+    },
+    {
+      "question": "What is the capital of France?",
+      "expected_document": null,
+      "must_contain": ""
+    },
+    {
+      "question": "What is the policy for paternity leave extension beyond 6 months?",
+      "expected_document": null,
+      "must_contain": ""
+    },
+    {
+      "question": "Does the Professional plan include on-premise air-gapped deployment?",
+      "expected_document": null,
+      "must_contain": ""
+    }
+  ],
+  "follow_ups": [
+    {
+      "history": [
+        {
+          "role": "user",
+          "content": "How many paid leave days do full-time employees receive?"
+        },
+        {
+          "role": "assistant",
+          "content": "Core Full-Time employees receive 27 business days of paid leave annually."
+        }
+      ],
+      "follow_up": "What about contractors?",
+      "expected_document": "employee-handbook.md"
+    },
+    {
+      "history": [
+        {
+          "role": "user",
+          "content": "What is the project limit for the Starter plan?"
+        },
+        {
+          "role": "assistant",
+          "content": "The Starter Tier plan allows up to 5 projects."
+        }
+      ],
+      "follow_up": "What is the limit on the Professional plan?",
+      "expected_document": "product-faq.md"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+pydantic>=2
+pydantic-settings
+langchain>=1.0,<2
+langchain-google-genai>=4.4,<5
+# Imported directly in core/errors.py to recognise timeouts (also pulled in by google-genai).
+httpx
+chromadb==1.5.9
+langchain-chroma==1.1.0
+langchain-text-splitters==1.1.3
+python-multipart==0.0.32

@@ -1,0 +1,14 @@
+# Secrets — must be listed before the first commit
+.env
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Tooling / OS
+.idea/
+.vscode/
+.DS_Store
+data/

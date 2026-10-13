@@ -1,0 +1,14 @@
+[tool.black]
+line-length = 88
+target-version = ["py311"]
+extend-exclude = "\\.venv"
+
+[tool.isort]
+profile = "black"
+line_length = 88
+skip = [".venv"]
+
+[tool.pytest.ini_options]
+# Lets tests do `from app...` without installing the project as a package.
+pythonpath = ["."]
+testpaths = ["tests"]
