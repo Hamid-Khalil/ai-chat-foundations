@@ -7,7 +7,7 @@ from langchain_core.embeddings import Embeddings
 try:
     from langchain_chroma import Chroma
 except ImportError:
-    from langchain_community.vectorstores import Chroma
+    from langchain_community.vectorstores import Chroma  # type: ignore
 
 
 class FakeEmbeddings(Embeddings):
