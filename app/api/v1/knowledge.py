@@ -3,7 +3,6 @@
 from fastapi import APIRouter, File, UploadFile, status
 
 from app.core.config import get_settings
-from app.core.errors import DocTooLargeError, DocUnsupportedTypeError
 from app.schemas.knowledge import (
     DeleteResult,
     DocumentInfo,
@@ -23,17 +22,19 @@ router = APIRouter()
     status_code=status.HTTP_201_CREATED,
     tags=["Knowledge Base"],
     summary="Upload and ingest a document into the knowledge base",
-    description="Accepts a .txt or .md file, strips traversal sequences, normalizes formatting, segments content into overlapping chunks, generates embeddings, and persists them into Chroma.",
+    description="Accepts a .txt, .md, or .pdf file, strips traversal sequences, normalizes formatting, segments content into overlapping chunks, generates embeddings, and persists them into Chroma.",
     responses={
         400: {
             "description": "Document is empty or contains only whitespace (DOC_EMPTY)."
         },
         409: {
-            "description": "Identical document already exists in the knowledge base (DOC_DUPLICATE)."
+            "description": "Identical document already exists (DOC_DUPLICATE) or document limit reached (DOC_LIMIT_REACHED)."
         },
-        413: {"description": "Document exceeds maximum upload size (DOC_TOO_LARGE)."},
+        413: {
+            "description": "Document exceeds maximum upload size or 10-page PDF limit (DOC_TOO_LARGE)."
+        },
         415: {
-            "description": "Unsupported file format. Only .txt and .md are accepted (DOC_UNSUPPORTED_TYPE)."
+            "description": "Unsupported file format or corrupt/non-UTF-8 content (DOC_UNSUPPORTED_TYPE)."
         },
         422: {"description": "Request validation error."},
         429: {"description": "Upstream embedding provider rate limit reached."},
@@ -42,17 +43,10 @@ router = APIRouter()
     },
 )
 async def upload_document(file: UploadFile = File(...)) -> DocumentInfo:
-    """Accept .txt/.md upload, validate size, and delegate to IngestionService."""
+    """Read upload stream with size cap and delegate ingestion to IngestionService."""
     settings = get_settings()
     filename = file.filename or ""
-
-    if not (filename.lower().endswith(".txt") or filename.lower().endswith(".md")):
-        raise DocUnsupportedTypeError("Only .txt and .md files are supported.")
-
     data = await file.read(settings.rag_max_upload_bytes + 1)
-    if len(data) > settings.rag_max_upload_bytes:
-        raise DocTooLargeError()
-
     service = get_ingestion_service()
     return await service.ingest_document(filename=filename, data=data)
 
@@ -90,6 +84,9 @@ async def delete_document(document_id: str) -> DeleteResult:
     return await service.delete_document(document_id)
 
 
+# Architectural Note (Task 2.1):
+# Search is a POST endpoint rather than GET because natural-language queries and
+# document_id filter arrays can be long and must not be exposed in URLs or server access logs.
 @router.post(
     "/search",
     response_model=SearchResponse,
@@ -106,16 +103,24 @@ async def delete_document(document_id: str) -> DeleteResult:
 )
 async def search_knowledge_base(payload: SearchRequest) -> SearchResponse:
     """Search the vector store and return relevant chunks with similarity scores."""
+    settings = get_settings()
+    effective_top_k = (
+        payload.top_k if payload.top_k is not None else settings.rag_top_k_default
+    )
+    effective_min_score = (
+        payload.min_score if payload.min_score is not None else settings.rag_min_score
+    )
+
     service = get_retrieval_service()
     results = await service.retrieve(
         query=payload.query.strip(),
-        top_k=payload.top_k,
+        top_k=effective_top_k,
         document_ids=payload.document_ids,
-        min_score=payload.min_score,
+        min_score=effective_min_score,
     )
     return SearchResponse(
-        query=payload.query,
-        top_k=payload.top_k,
-        min_score=payload.min_score,
+        query=payload.query.strip(),
+        top_k=effective_top_k,
+        min_score=effective_min_score,
         results=results,
     )

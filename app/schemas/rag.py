@@ -5,13 +5,18 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.core.config import get_settings
-from app.schemas.chat import ChatReply, ConversationRequest, Usage
+from app.schemas.chat import ChatReply, ConversationRequest
+from app.schemas.knowledge import SearchResultItem, validate_document_ids_list
+
+# Task 2.1 internal alias for retrieved chunks
+RetrievedChunk = SearchResultItem
 
 
 class RagAskRequest(BaseModel):
     """Payload for POST /rag/ask."""
 
     model_config = ConfigDict(
+        str_strip_whitespace=True,
         json_schema_extra={
             "example": {
                 "question": "What is the lodging expense ceiling per night in standard cities?",
@@ -19,13 +24,18 @@ class RagAskRequest(BaseModel):
                 "document_ids": None,
                 "thinking_level": "low",
             }
-        }
+        },
     )
 
     question: str = Field(..., min_length=1, max_length=500)
     top_k: int | None = Field(default=None, ge=1, le=8)
-    document_ids: list[str] | None = Field(default=None, max_length=20)
+    document_ids: list[str] | None = Field(default=None)
     thinking_level: Literal["low", "medium", "high"] = "low"
+
+    @field_validator("document_ids")
+    @classmethod
+    def _check_document_ids(cls, v: list[str] | None) -> list[str] | None:
+        return validate_document_ids_list(v)
 
 
 class SourceChunk(BaseModel):
@@ -36,7 +46,7 @@ class SourceChunk(BaseModel):
     filename: str
     chunk_index: int
     score: float
-    snippet: str
+    snippet: str = Field(..., max_length=300)
     cited: bool = False
     page: int | None = None
 
@@ -84,13 +94,21 @@ class RagMessagesRequest(ConversationRequest):
     )
 
     top_k: int | None = Field(default=None, ge=1, le=8)
-    document_ids: list[str] | None = Field(default=None, max_length=20)
+    document_ids: list[str] | None = Field(default=None)
+
+    @field_validator("document_ids")
+    @classmethod
+    def _check_document_ids(cls, v: list[str] | None) -> list[str] | None:
+        return validate_document_ids_list(v)
 
     @field_validator("messages")
     @classmethod
     def _validate_last_message_length(cls, messages):
         max_chars = get_settings().rag_max_question_chars
-        if len(messages[-1].content) > max_chars:
+        last_content = messages[-1].content.strip()
+        if not last_content:
+            raise ValueError("Last user message cannot be blank.")
+        if len(last_content) > max_chars:
             raise ValueError(
                 f"Last user message must be at most {max_chars} characters."
             )

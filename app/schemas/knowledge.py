@@ -1,6 +1,20 @@
 """Schemas for knowledge base management and search operations."""
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+def validate_document_ids_list(v: list[str] | None) -> list[str] | None:
+    """Validate that document_ids, if provided, has 1-20 items, each 1-64 chars."""
+    if v is None:
+        return None
+    if len(v) < 1 or len(v) > 20:
+        raise ValueError("document_ids must contain between 1 and 20 items.")
+    for doc_id in v:
+        if not isinstance(doc_id, str) or not doc_id.strip() or len(doc_id) > 64:
+            raise ValueError(
+                "Each document_id must be a non-empty string of at most 64 characters."
+            )
+    return v
 
 
 class DocumentInfo(BaseModel):
@@ -33,6 +47,7 @@ class SearchRequest(BaseModel):
     """Payload for POST /knowledge/search."""
 
     model_config = ConfigDict(
+        str_strip_whitespace=True,
         json_schema_extra={
             "example": {
                 "query": "How many days of paid leave do full-time employees receive?",
@@ -40,21 +55,27 @@ class SearchRequest(BaseModel):
                 "document_ids": None,
                 "min_score": 0.66,
             }
-        }
+        },
     )
 
     query: str = Field(
         ..., min_length=1, max_length=500, description="Search query string."
     )
-    top_k: int = Field(
-        default=4, ge=1, le=8, description="Number of results to retrieve."
+    top_k: int | None = Field(
+        default=None, ge=1, le=8, description="Number of results to retrieve."
     )
     document_ids: list[str] | None = Field(
-        default=None, description="Optional document filter."
+        default=None,
+        description="Optional document filter (1-20 ids, each <= 64 chars).",
     )
-    min_score: float = Field(
-        default=0.0, ge=0.0, le=1.0, description="Score threshold override."
+    min_score: float | None = Field(
+        default=None, ge=0.0, le=1.0, description="Score threshold override."
     )
+
+    @field_validator("document_ids")
+    @classmethod
+    def _check_document_ids(cls, v: list[str] | None) -> list[str] | None:
+        return validate_document_ids_list(v)
 
 
 class SearchResultItem(BaseModel):

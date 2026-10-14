@@ -16,7 +16,7 @@ from tests.conftest import FailingEmbeddings
 try:
     from langchain_chroma import Chroma
 except ImportError:
-    from langchain_community.vectorstores import Chroma
+    from langchain_community.vectorstores import Chroma  # type: ignore
 
 
 @pytest.mark.asyncio

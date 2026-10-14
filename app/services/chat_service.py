@@ -1,6 +1,5 @@
 """Chat business logic: build messages, call LLM safely with tools, shape the response."""
 
-import inspect
 import logging
 import time
 from collections.abc import Sequence
@@ -118,11 +117,7 @@ async def _call_model(
 
                 selected_tool = TOOLS_BY_NAME.get(tool_name)
                 if selected_tool:
-                    # Support both sync and async tool execution
-                    if inspect.iscoroutinefunction(selected_tool.func):
-                        tool_output = await selected_tool.ainvoke(tool_args)
-                    else:
-                        tool_output = selected_tool.invoke(tool_args)
+                    tool_output = await selected_tool.ainvoke(tool_args)
                 else:
                     tool_output = f"Tool '{tool_name}' not found."
 

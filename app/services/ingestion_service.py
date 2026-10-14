@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from datetime import datetime, timezone
 
 import pypdf
@@ -14,12 +15,14 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from app.core.config import get_settings
 from app.core.errors import (
+    AppError,
     DocDuplicateError,
     DocEmptyError,
     DocLimitReachedError,
     DocNotFoundError,
     DocTooLargeError,
     DocUnsupportedTypeError,
+    from_llm_exception,
 )
 from app.core.vector_store import get_vector_store
 from app.schemas.knowledge import DeleteResult, DocumentInfo, DocumentList
@@ -45,10 +48,10 @@ def decode_text(data: bytes) -> str:
         data = data[3:]
     try:
         return data.decode("utf-8")
-    except UnicodeDecodeError:
+    except UnicodeDecodeError as exc:
         raise DocUnsupportedTypeError(
             "Invalid byte sequence; only valid UTF-8 is supported."
-        )
+        ) from exc
 
 
 def normalize_text(text: str) -> str:
@@ -80,12 +83,27 @@ def split_text(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         length_function=len,
+        add_start_index=True,
     )
-    chunks = splitter.create_documents([text])
+    doc = Document(
+        page_content=text,
+        metadata={
+            "document_id": document_id,
+            "filename": filename,
+            "sha256": sha256,
+            "created_at": created_at,
+            "characters": len(text),
+        },
+    )
+    chunks = splitter.split_documents([doc])
 
-    start_idx = 0
+    search_pos = 0
     for i, c in enumerate(chunks):
-        start_idx = text.find(c.page_content, start_idx)
+        start_idx = c.metadata.get("start_index", -1)
+        if start_idx is None or start_idx < 0:
+            start_idx = text.find(c.page_content, search_pos)
+        search_pos = max(0, start_idx)
+
         c.metadata["document_id"] = document_id
         c.metadata["filename"] = filename
         c.metadata["chunk_index"] = i
@@ -119,14 +137,17 @@ class IngestionService:
             else ""
         )
 
+        # 1. Check extension (.txt, .md, and .pdf for Task 4.4)
         if ext not in ("txt", "md", "pdf"):
             raise DocUnsupportedTypeError(
                 "Only .txt, .md, and .pdf files are supported."
             )
 
+        # 2. Check byte size limit
         if len(data) > self.settings.rag_max_upload_bytes:
             raise DocTooLargeError()
 
+        # 3. Decode and normalize text
         page_starts = None
         if ext == "pdf":
             try:
@@ -136,8 +157,8 @@ class IngestionService:
                 num_pages = len(reader.pages)
             except DocUnsupportedTypeError:
                 raise
-            except Exception:
-                raise DocUnsupportedTypeError("Invalid or corrupt PDF.")
+            except Exception as exc:
+                raise DocUnsupportedTypeError("Invalid or corrupt PDF.") from exc
 
             if num_pages > 10:
                 raise DocTooLargeError("PDF exceeds 10 pages.")
@@ -161,20 +182,28 @@ class IngestionService:
         if not text:
             raise DocEmptyError()
 
+        # 4. Compute SHA-256 of normalized text and check for duplicates
         doc_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        document_id = doc_hash[:16]
+        existing = self.vector_store.get(where={"sha256": doc_hash})
+        if existing and existing.get("ids"):
+            metadatas = existing.get("metadatas") or []
+            existing_doc_id = (
+                metadatas[0].get("document_id", doc_hash[:16])
+                if metadatas and metadatas[0]
+                else doc_hash[:16]
+            )
+            raise DocDuplicateError(existing_doc_id)
 
-        existing = self.vector_store.get(where={"document_id": document_id})
-        if existing and existing["ids"]:
-            raise DocDuplicateError(document_id)
-
+        # 5. Enforce maximum document count limit
         listing = await self.list_documents()
         if len(listing.documents) >= self.settings.rag_max_documents:
             raise DocLimitReachedError(
                 f"Knowledge base is at maximum capacity ({self.settings.rag_max_documents} documents)."
             )
 
-        created_at = datetime.now(timezone.utc).isoformat()
+        # 6. Generate random hex document_id and split into chunks
+        document_id = uuid.uuid4().hex
+        created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         chunks = split_text(
             text=text,
             document_id=document_id,
@@ -186,26 +215,28 @@ class IngestionService:
             page_starts=page_starts,
         )
 
+        # 7 & 8. Store in batches with atomic rollback and LLM exception mapping
         batch_size = self.settings.embedding_batch_size
         added_ids: list[str] = []
         try:
             # Atomic Ingestion Rollback:
-            # A half-ingested document is significantly worse than a failed upload because
-            # orphaned chunks pollute vector search, create split contexts, and cause phantom
-            # citations for documents that are not completely indexed.
+            # A half-ingested document is worse than a failed upload because orphaned chunks
+            # pollute future search results, distort rankings, and produce incomplete answers.
             for i in range(0, len(chunks), batch_size):
                 batch = chunks[i : i + batch_size]
                 ids = [f"{document_id}:{c.metadata['chunk_index']}" for c in batch]
                 await self.vector_store.aadd_documents(documents=batch, ids=ids)
                 added_ids.extend(ids)
-        except Exception:
+        except Exception as exc:
             if added_ids:
                 await self.vector_store.adelete(ids=added_ids)
-            raise
+            if isinstance(exc, AppError):
+                raise
+            raise from_llm_exception(exc) from exc
 
         duration = time.perf_counter() - start_time
         logger.info(
-            "Document ingested successfully: document_id=%s, chunks=%d, duration=%.3fs",
+            "Document ingested: document_id=%s chunks=%d duration=%.3fs",
             document_id,
             len(chunks),
             duration,
@@ -226,6 +257,8 @@ class IngestionService:
 
         doc_map: dict[str, dict] = {}
         for meta in metadatas:
+            if not meta:
+                continue
             doc_id = meta.get("document_id")
             if not doc_id:
                 continue
@@ -268,7 +301,7 @@ class IngestionService:
         await self.vector_store.adelete(ids=ids)
         duration = time.perf_counter() - start_time
         logger.info(
-            "Document deleted successfully: document_id=%s, deleted_chunks=%d, duration=%.3fs",
+            "Document deleted: document_id=%s deleted_chunks=%d duration=%.3fs",
             document_id,
             len(ids),
             duration,

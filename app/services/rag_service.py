@@ -16,6 +16,19 @@ from app.services.retrieval_service import get_retrieval_service
 logger = logging.getLogger(__name__)
 
 
+def _extract_response_text(response: AIMessage) -> str:
+    """Return response.text per project standard, falling back only if mock lacks .text."""
+    text_attr = getattr(response, "text", None)
+    if isinstance(text_attr, str):
+        return text_attr
+    if callable(text_attr):
+        val = text_attr()
+        if isinstance(val, str):
+            return val
+    content = getattr(response, "content", "")
+    return content if isinstance(content, str) else ""
+
+
 def _build_context(chunks: list) -> tuple[str, list[SourceChunk]]:
     settings = get_settings()
     sources = []
@@ -75,9 +88,8 @@ class RagService:
         )
 
         # Architectural Rule (Task 3.1): Debug retrieval first.
-        # If no chunk passes the similarity threshold, we return NO_ANSWER_TEXT immediately
-        # without invoking the chat model. Skipping the chat model call saves quota, avoids
-        # token latency, and mathematically prevents hallucinating answers from irrelevant context.
+        # Skipping the chat model call when no chunks pass the threshold saves quota,
+        # avoids latency, and prevents the model from inventing answers from irrelevant text.
         if not passed_chunks:
             return RagReply(
                 reply=NO_ANSWER_TEXT,
@@ -107,12 +119,20 @@ class RagService:
         except Exception as exc:
             raise from_llm_exception(exc) from exc
 
-        reply_text = response.content
-        if not reply_text or not isinstance(reply_text, str):
+        reply_text = _extract_response_text(response)
+        if not reply_text or not reply_text.strip():
             raise AppError.from_code("LLM_EMPTY_RESPONSE")
 
         # Regex matches both standard [1] and unicode 【1】 brackets
         cited_numbers = {int(m) for m in re.findall(r"[\[【](\d+)[\]】]", reply_text)}
+        valid_source_ids = {src.source_id for src in sources}
+        invalid_citations = cited_numbers - valid_source_ids
+        if invalid_citations:
+            logger.warning(
+                "Ignored non-existent citation numbers in reply: invalid_count=%d",
+                len(invalid_citations),
+            )
+
         for src in sources:
             if src.source_id in cited_numbers:
                 src.cited = True
@@ -159,11 +179,9 @@ class RagService:
                 history[0].content, top_k, document_ids, thinking_level
             )
 
-        # Architectural Rule (Task 3.2): Multi-turn conversational RAG requires two sequential LLM calls:
-        # Call 1 (Condensation): Rewrites the dialogue history + last user follow-up into a self-contained,
-        # standalone search query without conversational references or missing subjects.
-        # Call 2 (Generation): Executes vector search on the standalone query, builds context, and generates
-        # a grounded response with verified citations.
+        # Architectural Rule (Task 3.2): One follow-up costs two model calls:
+        # Call 1 rewrites the conversation and final user turn into a standalone question.
+        # Call 2 generates a grounded answer from the chunks retrieved by that standalone question.
         condense_msgs = [SystemMessage(content=CONDENSE_SYSTEM_PROMPT)]
         for msg in history:
             if msg.role == "user":
@@ -177,7 +195,7 @@ class RagService:
         except Exception as exc:
             raise from_llm_exception(exc) from exc
 
-        standalone = condense_resp.content.strip()
+        standalone = _extract_response_text(condense_resp).strip()
         if not standalone:
             raise AppError.from_code("LLM_EMPTY_RESPONSE")
 
