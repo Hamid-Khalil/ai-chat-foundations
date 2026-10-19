@@ -138,3 +138,16 @@ User Request -> Condensation (if multi-turn) -> Embed & Retrieve (k=top_k) -> Sc
 * **MongoDB Version:** 7.0.45 (Downgraded from 8 due to Linux kernel compatibility issue SERVER-121912).
 * **Permissions:** `app_user` can successfully write to `ai_chat_foundations` but is correctly blocked from accessing the `admin` database (`not authorized on admin`).
 * **Persistence:** Data written to the named volume survives container deletion and recreation.
+
+### Task 0.3: PyMongo Async Smoke Test Findings
+* **Timezone Awareness:** A naive client returns datetimes with `tzinfo=None`. A client instantiated with `tz_aware=True` returns UTC datetime with `tzinfo=FixedOffset(0, 'UTC')`.
+* **Missing ID:** `find_one` returns `None` without throwing an exception.
+* **Duplicate `_id` & Unique Indexes:** MongoDB raises `pymongo.errors.DuplicateKeyError`. Calling `create_index` with identical specifications is idempotent.
+* **Cursor Pagination & `to_list`:** `to_list(None)` retrieves results up to the cursor limit. Calling `to_list(0)` raises `ValueError: to_list() length must be greater than 0`.
+* **Atomic Counter vs Naive Counter:** 
+  * Under 20 concurrent requests, `find_one_and_update` with `$inc` strictly returned sequential numbers 1 to 20 without duplicates.
+  * The naive read-modify-write pattern suffered race conditions and lost updates, producing duplicate and missing values (e.g., predominantly 1s and 2s).
+* **Failure Modes:**
+  * **(a) DB Down:** Stopping the container causes `ServerSelectionTimeoutError` after 3.0 seconds (`serverSelectionTimeoutMS=3000`).
+  * **(b) Auto-Recovery:** Starting the container allows the same client instance to reconnect and execute commands without restarting the application.
+  * **(c) Bad Password:** Passing invalid credentials raises `OperationFailure: Authentication failed` in under 0.1s.
