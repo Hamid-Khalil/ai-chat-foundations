@@ -131,3 +131,10 @@ User Request -> Condensation (if multi-turn) -> Embed & Retrieve (k=top_k) -> Sc
 6. **Corpus Calibration:** The `0.66` threshold was tuned on a small test corpus and needs recalibration on production data.
 7. **Free-Tier Limits:** Subject to API rate limits; data sent over free-tier keys may be logged by Google.
 8. **Immutability:** Changing chunk size or embedding model requires purging and re-ingesting the whole database.
+
+## Findings
+
+### Task 0.2: MongoDB Limits and Persistence
+* **MongoDB Version:** 7.0.45 (Downgraded from 8 due to Linux kernel compatibility issue SERVER-121912).
+* **Permissions:** `app_user` can successfully write to `ai_chat_foundations` but is correctly blocked from accessing the `admin` database (`not authorized on admin`).
+* **Persistence:** Data written to the named volume survives container deletion and recreation.
