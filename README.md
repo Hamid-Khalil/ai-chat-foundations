@@ -151,3 +151,11 @@ User Request -> Condensation (if multi-turn) -> Embed & Retrieve (k=top_k) -> Sc
   * **(a) DB Down:** Stopping the container causes `ServerSelectionTimeoutError` after 3.0 seconds (`serverSelectionTimeoutMS=3000`).
   * **(b) Auto-Recovery:** Starting the container allows the same client instance to reconnect and execute commands without restarting the application.
   * **(c) Bad Password:** Passing invalid credentials raises `OperationFailure: Authentication failed` in under 0.1s.
+
+### Task 1.2: MongoDB Indexes Verification (`getIndexes()`)
+* **`conversations` indexes:**
+  * `_id_`: `{"_id": 1}`
+  * `idx_conversation_list`: `{"archived": 1, "updated_at": -1, "_id": -1}`
+* **`messages` indexes:**
+  * `_id_`: `{"_id": 1}`
+  * `idx_message_conv_seq`: `{"conversation_id": 1, "seq": 1}` (`unique: true`)

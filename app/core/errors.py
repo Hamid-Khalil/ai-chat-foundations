@@ -29,6 +29,16 @@ _ERRORS: dict[str, tuple[int, str]] = {
         "The AI service took too long to answer. Please try again.",
     ),
     "INTERNAL_ERROR": (500, "Something went wrong on our side. Please try again."),
+
+    "DB_UNAVAILABLE": (503, "The database is currently unavailable. Please try again later."),
+    "DB_ERROR": (500, "An unexpected database error occurred."),
+    "CONVERSATION_NOT_FOUND": (404, "The requested conversation could not be found."),
+    "MESSAGE_NOT_FOUND": (404, "The requested message could not be found."),
+    "CONVERSATION_ARCHIVED": (409, "Cannot modify an archived conversation."),
+    "CONVERSATION_FULL": (409, "This conversation has reached the maximum allowed messages."),
+    "INVALID_CURSOR": (400, "The provided pagination cursor is invalid or malformed."),
+    "FEEDBACK_INVALID_TARGET": (400, "Feedback can only be submitted for assistant messages."),
+
 }
 
 
@@ -162,3 +172,46 @@ class DocNotFoundError(AppError):
         super().__init__(
             code="DOC_NOT_FOUND", status=404, message=f"Document '{doc_id}' not found."
         )
+
+
+from pymongo.errors import (
+    ServerSelectionTimeoutError,
+    ConnectionFailure,
+    NetworkTimeout,
+    OperationFailure,
+    PyMongoError,
+)
+
+
+# Why DuplicateKeyError is NOT handled here:
+# Duplicate-key errors (e.g., duplicate document SHA256, duplicate message sequence)
+# are business-logic violations, not system crashes. They must be caught in the
+# repository or service layer where context is known, so they can be mapped to
+# a 409 Conflict rather than a generic 500 error.
+def from_db_exception(exc: Exception) -> AppError:
+    """Map PyMongo driver exceptions to AppError (503/500) without leaking driver details."""
+    from pymongo.errors import (
+        ConnectionFailure,
+        NetworkTimeout,
+        OperationFailure,
+        PyMongoError,
+        ServerSelectionTimeoutError,
+    )
+
+    if isinstance(
+        exc,
+        (
+            ServerSelectionTimeoutError,
+            ConnectionFailure,
+            NetworkTimeout,
+            OperationFailure,
+        ),
+    ):
+        logger.error("Database connection error: %s", type(exc).__name__)
+        return AppError.from_code("DB_UNAVAILABLE")
+    if isinstance(exc, PyMongoError):
+        logger.error("Unexpected database error: %s", type(exc).__name__)
+        return AppError.from_code("DB_ERROR")
+
+    logger.error("Unhandled exception in DB layer: %s", type(exc).__name__)
+    return AppError.from_code("INTERNAL_ERROR")

@@ -8,6 +8,8 @@ from typing import Any
 from fastapi import FastAPI
 
 from app.api.v1.router import api_router
+from app.repositories.indexes import ensure_indexes
+from app.core.mongo import init_mongo_client, close_mongo_client, get_mongo_client
 from app.core.config import get_settings
 from app.core.errors import (
     AppError,
@@ -52,7 +54,21 @@ OPENAPI_TAGS: list[dict[str, Any]] = [
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Refuse to start without a valid model key configured."""
     get_settings().require_api_key()
+    
+    # Initialize MongoDB Client
+    await init_mongo_client()
+    try:
+        await get_mongo_client().admin.command("ping")
+        logging.info("MongoDB connected successfully.")
+        await ensure_indexes(get_mongo_client()[get_settings().mongodb_db])
+    except Exception as e:
+        # Log the host only. NEVER log the URI or password!
+        logging.warning("MongoDB ping failed on startup (host: 127.0.0.1:27017). App starting statelessly.")
+        
     yield
+    
+    # Close MongoDB Client
+    await close_mongo_client()
 
 
 app = FastAPI(
@@ -81,3 +97,38 @@ app.include_router(api_router, prefix="/api/v1")
 )
 async def health() -> HealthResponse:
     return HealthResponse(status="ok")
+
+
+from pydantic import BaseModel
+import time
+from app.repositories.indexes import ensure_indexes
+from app.core.mongo import get_mongo_client, get_database
+from app.core.errors import from_db_exception
+
+class DBHealthResponse(BaseModel):
+    status: str
+    database: str
+    latency_ms: int
+
+@app.get(
+    "/api/v1/health/db",
+    tags=["Health"],
+    response_model=DBHealthResponse,
+    summary="Check Database Health"
+)
+async def health_db() -> DBHealthResponse:
+    """Pings MongoDB to verify connection health and measures latency."""
+    client = get_mongo_client()
+    db = get_database()
+    start_time = time.perf_counter()
+    
+    try:
+        await client.admin.command("ping")
+        latency = int((time.perf_counter() - start_time) * 1000)
+        return DBHealthResponse(
+            status="ok",
+            database=db.name,
+            latency_ms=latency
+        )
+    except Exception as e:
+        raise from_db_exception(e)
