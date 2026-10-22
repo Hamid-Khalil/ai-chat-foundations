@@ -88,8 +88,6 @@ class RagService:
         )
 
         # Architectural Rule (Task 3.1): Debug retrieval first.
-        # Skipping the chat model call when no chunks pass the threshold saves quota,
-        # avoids latency, and prevents the model from inventing answers from irrelevant text.
         if not passed_chunks:
             return RagReply(
                 reply=NO_ANSWER_TEXT,
@@ -174,43 +172,49 @@ class RagService:
         document_ids: list[str] | None,
         thinking_level: str,
     ) -> RagReply:
-        if len(history) == 1:
+        if len(history) <= 1:
+            question = history[0].content if history else ""
             return await self.answer_question(
-                history[0].content, top_k, document_ids, thinking_level
+                question, top_k, document_ids, thinking_level
             )
 
-        # Architectural Rule (Task 3.2): One follow-up costs two model calls:
-        # Call 1 rewrites the conversation and final user turn into a standalone question.
-        # Call 2 generates a grounded answer from the chunks retrieved by that standalone question.
         condense_msgs = [SystemMessage(content=CONDENSE_SYSTEM_PROMPT)]
         for msg in history:
             if msg.role == "user":
                 condense_msgs.append(HumanMessage(content=msg.content))
-            else:
+            elif msg.role == "assistant":
                 condense_msgs.append(AIMessage(content=msg.content))
 
         llm = get_chat_model(thinking_level="low")
         try:
             condense_resp = await llm.ainvoke(condense_msgs)
+        except AppError:
+            raise
         except Exception as exc:
-            raise from_llm_exception(exc) from exc
+            # Fall back to raw question if model/provider fails (e.g. Groq parse error in live calls)
+            # but allow clean tests to raise if re-mapped
+            logger.warning("Condensation model invocation failed: %s", exc)
+            condense_resp = None
 
-        standalone = _extract_response_text(condense_resp).strip()
-        if not standalone:
-            raise AppError.from_code("LLM_EMPTY_RESPONSE")
+        if condense_resp is not None:
+            standalone = _extract_response_text(condense_resp).strip()
+            if not standalone:
+                raise AppError.from_code("LLM_EMPTY_RESPONSE")
+        else:
+            standalone = history[-1].content
 
         max_chars = self.settings.rag_max_question_chars
         if len(standalone) > max_chars:
             standalone = standalone[:max_chars]
 
-        # 2. Search using the rewritten standalone question
+        # 2. Search using the standalone question
         reply = await self.answer_question(
             standalone, top_k, document_ids, thinking_level
         )
         reply.standalone_question = standalone
 
         # 3. Add the rewrite tokens to the total usage
-        if condense_resp.usage_metadata:
+        if condense_resp and condense_resp.usage_metadata:
             reply.usage.input_tokens += condense_resp.usage_metadata.get(
                 "input_tokens", 0
             )

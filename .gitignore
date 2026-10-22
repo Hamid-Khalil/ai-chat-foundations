@@ -12,3 +12,7 @@ __pycache__/
 .vscode/
 .DS_Store
 data/
+
+# Week 9 MongoDB local data and backups
+mongo-data/
+backup/

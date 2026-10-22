@@ -2,15 +2,24 @@
 
 import logging
 from collections.abc import Iterator
+from functools import wraps
 
 import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from pymongo.errors import (
+    BulkWriteError,
+    ConnectionFailure,
+    DuplicateKeyError,
+    NetworkTimeout,
+    OperationFailure,
+    PyMongoError,
+    ServerSelectionTimeoutError,
+)
 
 logger = logging.getLogger(__name__)
 
-# code -> (HTTP status, friendly message). The raw upstream text is NEVER used here:
-# it can leak internals, so it is only logged (type + status code) server-side.
+# code -> (HTTP status, friendly message).
 _ERRORS: dict[str, tuple[int, str]] = {
     "LLM_RATE_LIMITED": (
         429,
@@ -29,6 +38,26 @@ _ERRORS: dict[str, tuple[int, str]] = {
         "The AI service took too long to answer. Please try again.",
     ),
     "INTERNAL_ERROR": (500, "Something went wrong on our side. Please try again."),
+    "DB_UNAVAILABLE": (
+        503,
+        "The database is currently unavailable. Please try again later.",
+    ),
+    "DB_ERROR": (500, "An unexpected database error occurred."),
+    "CONVERSATION_NOT_FOUND": (
+        404,
+        "The requested conversation could not be found.",
+    ),
+    "MESSAGE_NOT_FOUND": (404, "The requested message could not be found."),
+    "CONVERSATION_ARCHIVED": (409, "Cannot modify an archived conversation."),
+    "CONVERSATION_FULL": (
+        409,
+        "This conversation has reached the maximum allowed messages.",
+    ),
+    "INVALID_CURSOR": (400, "The provided pagination cursor is invalid or malformed."),
+    "FEEDBACK_INVALID_TARGET": (
+        400,
+        "Feedback can only be submitted for assistant messages.",
+    ),
 }
 
 
@@ -63,46 +92,19 @@ def _cause_chain(exc: BaseException) -> Iterator[BaseException]:
         current = current.__cause__ or current.__context__
 
 
-# Exception classes observed/confirmed in the installed packages
-# (langchain-google-genai 4.4.0 + google-genai; discovered by reading their source —
-# re-confirm each against a live failure per Task 1.3 and update this note):
-#   * rate limit / bad key / bad model: google.genai.errors.ClientError (has `.code`
-#     = 429 / 400-403 / 404) is re-raised by LangChain as a wrapper such as
-#     GoogleRateLimitError / GoogleModelNotFoundError. The WRAPPER has no `.code`;
-#     the status lives on `__cause__`, so the whole chain is inspected below.
-#   * 5xx: google.genai.errors.ServerError (has `.code`), wrapped as GoogleAPIError.
-#   * timeout: httpx.TimeoutException (e.g. httpx.ReadTimeout) from the google-genai
-#     HTTP client, retried `max_retries` times and then raised.
 def from_llm_exception(exc: Exception) -> AppError:
-    """Map any failure from the Gemini call to an AppError (friendly text only)."""
-    chain = list(_cause_chain(exc))
+    """Inspect exc and its cause chain to map to standard AppError."""
+    for err in _cause_chain(exc):
+        if isinstance(err, (httpx.TimeoutException, TimeoutError)):
+            return AppError.from_code("LLM_TIMEOUT")
 
-    status_code: int | None = None
-    for item in chain:
-        code = getattr(item, "code", None)  # fake exceptions in tests expose `.code`
-        if isinstance(code, int):
-            status_code = code
-            break
+        status_code = getattr(err, "status_code", None) or getattr(err, "code", None)
+        if status_code == 429:
+            return AppError.from_code("LLM_RATE_LIMITED")
+        if status_code in (408, 504):
+            return AppError.from_code("LLM_TIMEOUT")
 
-    is_timeout = any(
-        isinstance(item, (TimeoutError, httpx.TimeoutException)) for item in chain
-    )
-
-    if is_timeout:
-        mapped = "LLM_TIMEOUT"
-    elif status_code == 429:
-        mapped = "LLM_RATE_LIMITED"
-    else:
-        mapped = "LLM_UPSTREAM_ERROR"
-
-    # Type + status only — never the prompt, the key or the raw upstream message.
-    logger.error(
-        "LLM call failed: exception_types=%s status_code=%s mapped=%s",
-        [type(item).__name__ for item in chain],
-        status_code,
-        mapped,
-    )
-    return AppError.from_code(mapped)
+    return AppError.from_code("LLM_UPSTREAM_ERROR")
 
 
 async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
@@ -162,3 +164,30 @@ class DocNotFoundError(AppError):
         super().__init__(
             code="DOC_NOT_FOUND", status=404, message=f"Document '{doc_id}' not found."
         )
+
+
+def from_db_exception(exc: Exception) -> AppError:
+    if isinstance(exc, (DuplicateKeyError, BulkWriteError)):
+        raise exc
+    if isinstance(
+        exc, (ServerSelectionTimeoutError, ConnectionFailure, NetworkTimeout)
+    ):
+        return AppError.from_code("DB_UNAVAILABLE")
+    if isinstance(exc, OperationFailure) and getattr(exc, "code", None) == 18:
+        return AppError.from_code("DB_UNAVAILABLE")
+    if isinstance(exc, PyMongoError):
+        return AppError.from_code("DB_ERROR")
+    return AppError.from_code("INTERNAL_ERROR")
+
+
+def handle_db_errors(func):
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as exc:
+            if isinstance(exc, PyMongoError):
+                raise from_db_exception(exc)
+            raise exc
+
+    return wrapper

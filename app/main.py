@@ -14,6 +14,8 @@ from app.core.errors import (
     app_error_handler,
     unhandled_error_handler,
 )
+from app.core.mongo import close_mongo_client, get_mongo_client, init_mongo_client
+from app.repositories.indexes import ensure_indexes
 from app.schemas.chat import HealthResponse
 
 logging.basicConfig(
@@ -48,11 +50,30 @@ OPENAPI_TAGS: list[dict[str, Any]] = [
 ]
 
 
+# Client is created INSIDE the lifespan (never at import time) so that:
+# 1. It binds to Uvicorn's active asyncio event loop.
+# 2. Importing app.main in unit tests does not open background sockets.
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Refuse to start without a valid model key configured."""
     get_settings().require_api_key()
+
+    # Initialize MongoDB Client
+    await init_mongo_client()
+    try:
+        await get_mongo_client().admin.command("ping")
+        logging.info("MongoDB connected successfully.")
+        await ensure_indexes(get_mongo_client()[get_settings().mongodb_db])
+    except Exception as e:
+        # Log the host only. NEVER log the URI or password!
+        logging.warning(
+            "MongoDB ping failed on startup (host: 127.0.0.1:27017). App starting statelessly."
+        )
+
     yield
+
+    # Close MongoDB Client
+    await close_mongo_client()
 
 
 app = FastAPI(
@@ -81,3 +102,39 @@ app.include_router(api_router, prefix="/api/v1")
 )
 async def health() -> HealthResponse:
     return HealthResponse(status="ok")
+
+
+import time
+
+from pydantic import BaseModel
+
+from app.core.errors import from_db_exception
+from app.core.mongo import get_database, get_mongo_client
+from app.repositories.indexes import ensure_indexes
+
+
+class DBHealthResponse(BaseModel):
+    status: str
+    database: str
+    latency_ms: int
+
+
+@app.get(
+    "/api/v1/health/db",
+    tags=["Health"],
+    response_model=DBHealthResponse,
+    summary="Check Database Health",
+    responses={503: {"description": "Database unavailable (DB_UNAVAILABLE)"}},
+)
+async def health_db() -> DBHealthResponse:
+    """Pings MongoDB to verify connection health and measures latency."""
+    client = get_mongo_client()
+    db = get_database()
+    start_time = time.perf_counter()
+
+    try:
+        await client.admin.command("ping")
+        latency = int((time.perf_counter() - start_time) * 1000)
+        return DBHealthResponse(status="ok", database=db.name, latency_ms=latency)
+    except Exception as e:
+        raise from_db_exception(e)

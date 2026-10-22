@@ -3,7 +3,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Single source of truth for the allowed levels (used by Settings, schemas, /chat/model).
@@ -48,6 +48,46 @@ class Settings(BaseSettings):
     rag_max_question_chars: int = 500
     rag_max_upload_bytes: int = 200000
     rag_max_documents: int = 20
+
+    # --- Week 9 MongoDB Persistence Settings ---
+    mongodb_uri: SecretStr = Field(
+        default=SecretStr(
+            "mongodb://app_user:CHANGE_ME@127.0.0.1:27017/ai_chat_foundations?authSource=ai_chat_foundations"
+        )
+    )
+    mongodb_db: str = Field(default="ai_chat_foundations")
+    mongodb_timeout_ms: int = Field(default=3000)
+    history_max_messages: int = Field(default=18)
+    conversation_max_messages: int = Field(default=200)
+
+    @field_validator("mongodb_timeout_ms")
+    @classmethod
+    def validate_mongodb_timeout_ms(cls, v: int) -> int:
+        if not (500 <= v <= 30000):
+            raise ValueError(
+                "MONGODB_TIMEOUT_MS must be between 500 and 30000 milliseconds."
+            )
+        return v
+
+    @field_validator("history_max_messages")
+    @classmethod
+    def validate_history_max_messages(cls, v: int) -> int:
+        if not (2 <= v <= 18):
+            raise ValueError("HISTORY_MAX_MESSAGES must be between 2 and 18.")
+        if v % 2 != 0:
+            raise ValueError(
+                "HISTORY_MAX_MESSAGES must be an even number so history starts with a user message."
+            )
+        return v
+
+    @model_validator(mode="after")
+    def validate_conversation_limits(self) -> "Settings":
+        if self.conversation_max_messages < self.history_max_messages:
+            raise ValueError(
+                f"CONVERSATION_MAX_MESSAGES ({self.conversation_max_messages}) must be "
+                f"at least HISTORY_MAX_MESSAGES ({self.history_max_messages})."
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_rag_settings(self) -> "Settings":
