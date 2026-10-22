@@ -172,32 +172,36 @@ class RagService:
         document_ids: list[str] | None,
         thinking_level: str,
     ) -> RagReply:
-        # Fallback default: Just use the user's raw question
-        standalone = history[-1].content if history else ""
-        usage_add = None
+        if len(history) <= 1:
+            question = history[0].content if history else ""
+            return await self.answer_question(
+                question, top_k, document_ids, thinking_level
+            )
 
-        if len(history) > 1:
-            try:
-                condense_msgs = [SystemMessage(content=CONDENSE_SYSTEM_PROMPT)]
-                for msg in history:
-                    if msg.role == "user":
-                        condense_msgs.append(HumanMessage(content=msg.content))
-                    elif msg.role == "assistant":
-                        condense_msgs.append(AIMessage(content=msg.content))
+        condense_msgs = [SystemMessage(content=CONDENSE_SYSTEM_PROMPT)]
+        for msg in history:
+            if msg.role == "user":
+                condense_msgs.append(HumanMessage(content=msg.content))
+            elif msg.role == "assistant":
+                condense_msgs.append(AIMessage(content=msg.content))
 
-                llm = get_chat_model(thinking_level="low")
-                condense_resp = await llm.ainvoke(condense_msgs)
-                extracted = _extract_response_text(condense_resp).strip()
-                
-                if extracted and len(extracted) > 2:
-                    standalone = extracted
-                    
-                if getattr(condense_resp, "usage_metadata", None):
-                    usage_add = condense_resp.usage_metadata
-            except Exception as exc:
-                # GRACEFUL DEGRADATION: If Groq crashes parsing Llama-3's output, 
-                # we just ignore the rewrite and use the original question!
-                logger.warning(f"Groq condensation failed, using fallback question: {exc}")
+        llm = get_chat_model(thinking_level="low")
+        try:
+            condense_resp = await llm.ainvoke(condense_msgs)
+        except AppError:
+            raise
+        except Exception as exc:
+            # Fall back to raw question if model/provider fails (e.g. Groq parse error in live calls)
+            # but allow clean tests to raise if re-mapped
+            logger.warning("Condensation model invocation failed: %s", exc)
+            condense_resp = None
+
+        if condense_resp is not None:
+            standalone = _extract_response_text(condense_resp).strip()
+            if not standalone:
+                raise AppError.from_code("LLM_EMPTY_RESPONSE")
+        else:
+            standalone = history[-1].content
 
         max_chars = self.settings.rag_max_question_chars
         if len(standalone) > max_chars:
@@ -209,11 +213,17 @@ class RagService:
         )
         reply.standalone_question = standalone
 
-        # 3. Add the rewrite tokens to the total usage if it succeeded
-        if usage_add:
-            reply.usage.input_tokens += usage_add.get("input_tokens", 0)
-            reply.usage.output_tokens += usage_add.get("output_tokens", 0)
-            reply.usage.total_tokens += usage_add.get("total_tokens", 0)
+        # 3. Add the rewrite tokens to the total usage
+        if condense_resp and condense_resp.usage_metadata:
+            reply.usage.input_tokens += condense_resp.usage_metadata.get(
+                "input_tokens", 0
+            )
+            reply.usage.output_tokens += condense_resp.usage_metadata.get(
+                "output_tokens", 0
+            )
+            reply.usage.total_tokens += condense_resp.usage_metadata.get(
+                "total_tokens", 0
+            )
 
         return reply
 

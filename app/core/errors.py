@@ -2,32 +2,68 @@
 
 import logging
 from collections.abc import Iterator
+from functools import wraps
 
 import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from pymongo.errors import (
+    BulkWriteError,
+    ConnectionFailure,
+    DuplicateKeyError,
+    NetworkTimeout,
+    OperationFailure,
+    PyMongoError,
+    ServerSelectionTimeoutError,
+)
 
 logger = logging.getLogger(__name__)
 
+# code -> (HTTP status, friendly message).
 _ERRORS: dict[str, tuple[int, str]] = {
-    "LLM_RATE_LIMITED": (429, "The AI service is busy right now. Please try again in a moment."),
-    "LLM_UPSTREAM_ERROR": (502, "The AI service had a problem answering. Please try again later."),
-    "LLM_EMPTY_RESPONSE": (502, "The AI service returned an empty answer. Please try rephrasing your message."),
-    "LLM_TIMEOUT": (504, "The AI service took too long to answer. Please try again."),
+    "LLM_RATE_LIMITED": (
+        429,
+        "The AI service is busy right now. Please try again in a moment.",
+    ),
+    "LLM_UPSTREAM_ERROR": (
+        502,
+        "The AI service had a problem answering. Please try again later.",
+    ),
+    "LLM_EMPTY_RESPONSE": (
+        502,
+        "The AI service returned an empty answer. Please try rephrasing your message.",
+    ),
+    "LLM_TIMEOUT": (
+        504,
+        "The AI service took too long to answer. Please try again.",
+    ),
     "INTERNAL_ERROR": (500, "Something went wrong on our side. Please try again."),
-    "DB_UNAVAILABLE": (503, "The database is currently unavailable. Please try again later."),
+    "DB_UNAVAILABLE": (
+        503,
+        "The database is currently unavailable. Please try again later.",
+    ),
     "DB_ERROR": (500, "An unexpected database error occurred."),
-    "CONVERSATION_NOT_FOUND": (404, "The requested conversation could not be found."),
+    "CONVERSATION_NOT_FOUND": (
+        404,
+        "The requested conversation could not be found.",
+    ),
     "MESSAGE_NOT_FOUND": (404, "The requested message could not be found."),
     "CONVERSATION_ARCHIVED": (409, "Cannot modify an archived conversation."),
-    "CONVERSATION_FULL": (409, "This conversation has reached the maximum allowed messages."),
+    "CONVERSATION_FULL": (
+        409,
+        "This conversation has reached the maximum allowed messages.",
+    ),
     "INVALID_CURSOR": (400, "The provided pagination cursor is invalid or malformed."),
-    "FEEDBACK_INVALID_TARGET": (400, "Feedback can only be submitted for assistant messages."),
+    "FEEDBACK_INVALID_TARGET": (
+        400,
+        "Feedback can only be submitted for assistant messages.",
+    ),
 }
 
 
 class AppError(Exception):
     """An error that maps directly onto the standard error response."""
+
     def __init__(self, code: str, message: str, status: int) -> None:
         super().__init__(code)
         self.code = code
@@ -36,15 +72,18 @@ class AppError(Exception):
 
     @classmethod
     def from_code(cls, code: str) -> "AppError":
+        """Build an AppError from one of the fixed codes."""
         status, message = _ERRORS[code]
         return cls(code=code, message=message, status=status)
 
 
 def error_payload(code: str, message: str, status: int) -> dict[str, dict[str, object]]:
+    """The standard error body: {"error": {"code", "message", "status"}}."""
     return {"error": {"code": code, "message": message, "status": status}}
 
 
 def _cause_chain(exc: BaseException) -> Iterator[BaseException]:
+    """Yield `exc` and everything it was raised from (bounded, cycle-safe)."""
     seen: set[int] = set()
     current: BaseException | None = exc
     while current is not None and id(current) not in seen and len(seen) < 10:
@@ -54,16 +93,22 @@ def _cause_chain(exc: BaseException) -> Iterator[BaseException]:
 
 
 def from_llm_exception(exc: Exception) -> AppError:
-    print("\n========== EXACT GROQ ERROR ==========")
-    try:
-        print(getattr(exc, 'response', exc).text)
-    except Exception:
-        print(getattr(exc, 'response', exc))
-    print("======================================\n")
+    """Inspect exc and its cause chain to map to standard AppError."""
+    for err in _cause_chain(exc):
+        if isinstance(err, (httpx.TimeoutException, TimeoutError)):
+            return AppError.from_code("LLM_TIMEOUT")
+
+        status_code = getattr(err, "status_code", None) or getattr(err, "code", None)
+        if status_code == 429:
+            return AppError.from_code("LLM_RATE_LIMITED")
+        if status_code in (408, 504):
+            return AppError.from_code("LLM_TIMEOUT")
+
     return AppError.from_code("LLM_UPSTREAM_ERROR")
 
 
 async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
+    """Turn AppError into the standard error response."""
     return JSONResponse(
         status_code=exc.status,
         content=error_payload(exc.code, exc.message, exc.status),
@@ -71,6 +116,7 @@ async def app_error_handler(request: Request, exc: AppError) -> JSONResponse:
 
 
 async def unhandled_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Catch-all: log the type only, return a generic 500 in the standard shape."""
     logger.error("Unhandled %s on %s", type(exc).__name__, request.url.path)
     error = AppError.from_code("INTERNAL_ERROR")
     return JSONResponse(
@@ -84,27 +130,34 @@ class DocUnsupportedTypeError(AppError):
     def __init__(self, message: str = "Invalid file format or non-UTF-8 bytes."):
         super().__init__(code="DOC_UNSUPPORTED_TYPE", status=415, message=message)
 
+
 class DocTooLargeError(AppError):
     def __init__(self, message: str = "File exceeds the maximum upload size."):
         super().__init__(code="DOC_TOO_LARGE", status=413, message=message)
+
 
 class DocEmptyError(AppError):
     def __init__(self, message: str = "Document contains no usable text."):
         super().__init__(code="DOC_EMPTY", status=400, message=message)
 
+
 class DocDuplicateError(AppError):
     def __init__(self, doc_id: str):
         super().__init__(
-            code="DOC_DUPLICATE", status=409,
-            message=f"A document with identical content already exists (id: {doc_id})."
+            code="DOC_DUPLICATE",
+            status=409,
+            message=f"A document with identical content already exists (id: {doc_id}).",
         )
+
 
 class DocLimitReachedError(AppError):
     def __init__(self, limit: int):
         super().__init__(
-            code="DOC_LIMIT_REACHED", status=409,
-            message=f"Knowledge base document limit ({limit}) reached."
+            code="DOC_LIMIT_REACHED",
+            status=409,
+            message=f"Knowledge base document limit ({limit}) reached.",
         )
+
 
 class DocNotFoundError(AppError):
     def __init__(self, doc_id: str):
@@ -114,13 +167,11 @@ class DocNotFoundError(AppError):
 
 
 def from_db_exception(exc: Exception) -> AppError:
-    from pymongo.errors import (
-        ConnectionFailure, NetworkTimeout, OperationFailure,
-        PyMongoError, ServerSelectionTimeoutError, DuplicateKeyError, BulkWriteError
-    )
     if isinstance(exc, (DuplicateKeyError, BulkWriteError)):
         raise exc
-    if isinstance(exc, (ServerSelectionTimeoutError, ConnectionFailure, NetworkTimeout)):
+    if isinstance(
+        exc, (ServerSelectionTimeoutError, ConnectionFailure, NetworkTimeout)
+    ):
         return AppError.from_code("DB_UNAVAILABLE")
     if isinstance(exc, OperationFailure) and getattr(exc, "code", None) == 18:
         return AppError.from_code("DB_UNAVAILABLE")
@@ -130,14 +181,13 @@ def from_db_exception(exc: Exception) -> AppError:
 
 
 def handle_db_errors(func):
-    from functools import wraps
     @wraps(func)
     async def wrapper(*args, **kwargs):
         try:
             return await func(*args, **kwargs)
         except Exception as exc:
-            from pymongo.errors import PyMongoError
             if isinstance(exc, PyMongoError):
                 raise from_db_exception(exc)
             raise exc
+
     return wrapper

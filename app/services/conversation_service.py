@@ -106,20 +106,25 @@ from app.services import chat_service
 logger = logging.getLogger(__name__)
 
 
-def history_for_model(stored_messages: list[dict], per_message_limit: int) -> list[dict]:
+def history_for_model(
+    stored_messages: list[dict], per_message_limit: int
+) -> list[dict]:
     clean_history = []
     for msg in stored_messages:
         # Drop tool_calls and metadata so Groq doesn't crash on unresolved tools
-        clean_history.append({
-            "role": msg["role"],
-            "content": msg["content"][:per_message_limit] if msg["content"] else ""
-        })
-    
+        clean_history.append(
+            {
+                "role": msg["role"],
+                "content": msg["content"][:per_message_limit] if msg["content"] else "",
+            }
+        )
+
     # Drop leading assistant messages
     while clean_history and clean_history[0]["role"] == "assistant":
         clean_history.pop(0)
-        
+
     return clean_history
+
 
 def build_metadata(mode: str, reply: Any) -> Dict[str, Any]:
     usage_dict = {
@@ -191,7 +196,8 @@ async def chat(
         from app.services import chat_service
 
         reply = await chat_service.converse(
-            [ChatMessage(**m) for m in model_history], thinking_level=request.thinking_level
+            [ChatMessage(**m) for m in model_history],
+            thinking_level=request.thinking_level,
         )
     elif request.mode == "tools":
         from app.api.v1.assistant import AssistantReply
@@ -217,7 +223,10 @@ async def chat(
             settings, "gemini_thinking_level", "low"
         )
         reply = await get_rag_service().answer_conversation(
-            [ChatMessage(**m) for m in model_history], request.top_k, request.document_ids, thinking
+            [ChatMessage(**m) for m in model_history],
+            request.top_k,
+            request.document_ids,
+            thinking,
         )
     else:
         raise AppError.from_code("INTERNAL_ERROR")
