@@ -1,7 +1,9 @@
 import logging
 from typing import Optional
+
 from pymongo import AsyncMongoClient
 from pymongo.asynchronous.database import AsyncDatabase
+
 from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)

@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter
 
-from app.api.v1 import assistant, chat, knowledge, rag, sessions, conversations
+from app.api.v1 import assistant, chat, conversations, knowledge, rag, sessions
 
 api_router = APIRouter()
 

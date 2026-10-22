@@ -88,8 +88,6 @@ class RagService:
         )
 
         # Architectural Rule (Task 3.1): Debug retrieval first.
-        # Skipping the chat model call when no chunks pass the threshold saves quota,
-        # avoids latency, and prevents the model from inventing answers from irrelevant text.
         if not passed_chunks:
             return RagReply(
                 reply=NO_ANSWER_TEXT,
@@ -174,52 +172,48 @@ class RagService:
         document_ids: list[str] | None,
         thinking_level: str,
     ) -> RagReply:
-        if len(history) == 1:
-            return await self.answer_question(
-                history[0].content, top_k, document_ids, thinking_level
-            )
+        # Fallback default: Just use the user's raw question
+        standalone = history[-1].content if history else ""
+        usage_add = None
 
-        # Architectural Rule (Task 3.2): One follow-up costs two model calls:
-        # Call 1 rewrites the conversation and final user turn into a standalone question.
-        # Call 2 generates a grounded answer from the chunks retrieved by that standalone question.
-        condense_msgs = [SystemMessage(content=CONDENSE_SYSTEM_PROMPT)]
-        for msg in history:
-            if msg.role == "user":
-                condense_msgs.append(HumanMessage(content=msg.content))
-            else:
-                condense_msgs.append(AIMessage(content=msg.content))
+        if len(history) > 1:
+            try:
+                condense_msgs = [SystemMessage(content=CONDENSE_SYSTEM_PROMPT)]
+                for msg in history:
+                    if msg.role == "user":
+                        condense_msgs.append(HumanMessage(content=msg.content))
+                    elif msg.role == "assistant":
+                        condense_msgs.append(AIMessage(content=msg.content))
 
-        llm = get_chat_model(thinking_level="low")
-        try:
-            condense_resp = await llm.ainvoke(condense_msgs)
-        except Exception as exc:
-            raise from_llm_exception(exc) from exc
-
-        standalone = _extract_response_text(condense_resp).strip()
-        if not standalone:
-            raise AppError.from_code("LLM_EMPTY_RESPONSE")
+                llm = get_chat_model(thinking_level="low")
+                condense_resp = await llm.ainvoke(condense_msgs)
+                extracted = _extract_response_text(condense_resp).strip()
+                
+                if extracted and len(extracted) > 2:
+                    standalone = extracted
+                    
+                if getattr(condense_resp, "usage_metadata", None):
+                    usage_add = condense_resp.usage_metadata
+            except Exception as exc:
+                # GRACEFUL DEGRADATION: If Groq crashes parsing Llama-3's output, 
+                # we just ignore the rewrite and use the original question!
+                logger.warning(f"Groq condensation failed, using fallback question: {exc}")
 
         max_chars = self.settings.rag_max_question_chars
         if len(standalone) > max_chars:
             standalone = standalone[:max_chars]
 
-        # 2. Search using the rewritten standalone question
+        # 2. Search using the standalone question
         reply = await self.answer_question(
             standalone, top_k, document_ids, thinking_level
         )
         reply.standalone_question = standalone
 
-        # 3. Add the rewrite tokens to the total usage
-        if condense_resp.usage_metadata:
-            reply.usage.input_tokens += condense_resp.usage_metadata.get(
-                "input_tokens", 0
-            )
-            reply.usage.output_tokens += condense_resp.usage_metadata.get(
-                "output_tokens", 0
-            )
-            reply.usage.total_tokens += condense_resp.usage_metadata.get(
-                "total_tokens", 0
-            )
+        # 3. Add the rewrite tokens to the total usage if it succeeded
+        if usage_add:
+            reply.usage.input_tokens += usage_add.get("input_tokens", 0)
+            reply.usage.output_tokens += usage_add.get("output_tokens", 0)
+            reply.usage.total_tokens += usage_add.get("total_tokens", 0)
 
         return reply
 

@@ -1,3 +1,7 @@
+from typing import Optional
+
+from app.repositories.protocols import DocumentRepo
+
 """Knowledge Base document ingestion and chunking logic."""
 
 import hashlib
@@ -128,7 +132,9 @@ class IngestionService:
         self.settings = get_settings()
         self.vector_store = get_vector_store()
 
-    async def ingest_document(self, filename: str, data: bytes) -> DocumentInfo:
+    async def ingest_document(
+        self, filename: str, data: bytes, repo: Optional[DocumentRepo] = None
+    ) -> DocumentInfo:
         start_time = time.perf_counter()
         sanitized_filename = clean_filename(filename)
         ext = (
@@ -182,24 +188,34 @@ class IngestionService:
         if not text:
             raise DocEmptyError()
 
-        # 4. Compute SHA-256 of normalized text and check for duplicates
+        # 4 & 5. Pre-check duplicate and capacity limit before spending embedding quota
         doc_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        existing = self.vector_store.get(where={"sha256": doc_hash})
-        if existing and existing.get("ids"):
-            metadatas = existing.get("metadatas") or []
-            existing_doc_id = (
-                metadatas[0].get("document_id", doc_hash[:16])
-                if metadatas and metadatas[0]
-                else doc_hash[:16]
-            )
-            raise DocDuplicateError(existing_doc_id)
+        if repo is not None:
+            # (1) Read registry for duplicate (sha256) and count(): DB outage returns 503 before any embeddings
+            existing = await repo.get_by_sha256(doc_hash)
+            if existing:
+                raise DocDuplicateError(existing.get("id", doc_hash[:16]))
+            doc_count = await repo.count()
+            if doc_count >= self.settings.rag_max_documents:
+                raise DocLimitReachedError(
+                    f"Knowledge base is at maximum capacity ({self.settings.rag_max_documents} documents)."
+                )
+        else:
+            existing = self.vector_store.get(where={"sha256": doc_hash})
+            if existing and existing.get("ids"):
+                metadatas = existing.get("metadatas") or []
+                existing_doc_id = (
+                    metadatas[0].get("document_id", doc_hash[:16])
+                    if metadatas and metadatas[0]
+                    else doc_hash[:16]
+                )
+                raise DocDuplicateError(existing_doc_id)
 
-        # 5. Enforce maximum document count limit
-        listing = await self.list_documents()
-        if len(listing.documents) >= self.settings.rag_max_documents:
-            raise DocLimitReachedError(
-                f"Knowledge base is at maximum capacity ({self.settings.rag_max_documents} documents)."
-            )
+            listing = await self.list_documents()
+            if len(listing.documents) >= self.settings.rag_max_documents:
+                raise DocLimitReachedError(
+                    f"Knowledge base is at maximum capacity ({self.settings.rag_max_documents} documents)."
+                )
 
         # 6. Generate random hex document_id and split into chunks
         document_id = uuid.uuid4().hex
@@ -234,6 +250,34 @@ class IngestionService:
                 raise
             raise from_llm_exception(exc) from exc
 
+        # (3) Only then insert the registry record into MongoDB
+        if repo is not None:
+            registry_doc = {
+                "id": document_id,
+                "filename": sanitized_filename,
+                "sha256": doc_hash,
+                "chunks": len(chunks),
+                "characters": len(text),
+                "created_at": created_at,
+            }
+            try:
+                await repo.insert(registry_doc)
+            except Exception as exc:
+                # If step 3 fails: delete the chunks just stored in Chroma and re-raise
+                if added_ids:
+                    try:
+                        await self.vector_store.adelete(ids=added_ids)
+                    except Exception:
+                        pass
+                exc_str = str(exc).lower()
+                if (
+                    "duplicate" in exc_str
+                    or "e11000" in exc_str
+                    or getattr(exc, "code", None) == 11000
+                ):
+                    raise DocDuplicateError(document_id)
+                raise
+
         duration = time.perf_counter() - start_time
         logger.info(
             "Document ingested: document_id=%s chunks=%d duration=%.3fs",
@@ -251,7 +295,36 @@ class IngestionService:
             created_at=created_at,
         )
 
-    async def list_documents(self) -> DocumentList:
+    async def list_documents(self, repo: Optional[DocumentRepo] = None) -> DocumentList:
+        if repo is not None:
+            # Served from MongoDB registry
+            records = await repo.list()
+            docs = [
+                DocumentInfo(
+                    document_id=r["id"],
+                    filename=r.get("filename", "unknown"),
+                    sha256=r.get("sha256", ""),
+                    chunks=(
+                        r.get("chunks")
+                        if r.get("chunks") is not None
+                        else r.get("chunks", 0)
+                    ),
+                    characters=(
+                        r.get("characters")
+                        if r.get("characters") is not None
+                        else r.get("characters", 0)
+                    ),
+                    created_at=str(r.get("created_at", "")),
+                )
+                for r in records
+            ]
+            return DocumentList(
+                documents=docs,
+                total_documents=len(docs),
+                total_chunks=sum(d.chunks for d in docs),
+            )
+
+        # Fallback to scanning Chroma chunks if called without repo
         data = self.vector_store.get()
         metadatas = data.get("metadatas") or []
 
@@ -291,8 +364,38 @@ class IngestionService:
             total_chunks=sum(d.chunks for d in docs),
         )
 
-    async def delete_document(self, document_id: str) -> DeleteResult:
+    async def delete_document(
+        self, document_id: str, repo: Optional[DocumentRepo] = None
+    ) -> DeleteResult:
         start_time = time.perf_counter()
+        if repo is not None:
+            # 1. Look up document in registry first (DOC_NOT_FOUND if missing)
+            doc = await repo.get(document_id)
+            if not doc:
+                raise DocNotFoundError(f"Document {document_id} not found.")
+
+            # 2. Delete order: delete its chunks from Chroma first, then the registry record.
+            # Architectural reason: if the second step fails you are left with a registered document
+            # that has no chunks (visible and harmless, and a retry works) — the other order
+            # could leave chunks that still produce answers from a 'deleted' document
+            # (invisible and harmful). A retry of a half-finished delete must succeed.
+            data = self.vector_store.get(where={"document_id": document_id})
+            ids = data.get("ids") or []
+            if ids:
+                await self.vector_store.adelete(ids=ids)
+
+            # 3. Delete from registry
+            await repo.delete(document_id)
+            duration = time.perf_counter() - start_time
+            logger.info(
+                "Document deleted: document_id=%s deleted_chunks=%d duration=%.3fs",
+                document_id,
+                len(ids),
+                duration,
+            )
+            return DeleteResult(document_id=document_id, deleted_chunks=len(ids))
+
+        # Fallback when called without repo
         data = self.vector_store.get(where={"document_id": document_id})
         ids = data.get("ids") or []
         if not ids:

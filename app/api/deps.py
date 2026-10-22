@@ -21,3 +21,13 @@ def get_conversation_repo() -> MongoConversationRepo:
 
 def get_message_repo() -> MongoMessageRepo:
     return MongoMessageRepo(get_database())
+
+
+from app.repositories.mongo_documents import MongoDocumentRepo
+
+
+def get_document_repo() -> MongoDocumentRepo:
+    from app.core.mongo import get_database
+
+    db = get_database()
+    return MongoDocumentRepo(db.documents)

@@ -1,8 +1,10 @@
 """Knowledge Base document management and search endpoints."""
 
-from fastapi import APIRouter, File, UploadFile, status
+from fastapi import APIRouter, Depends, File, UploadFile, status
 
+from app.api.deps import get_document_repo
 from app.core.config import get_settings
+from app.repositories.protocols import DocumentRepo
 from app.schemas.knowledge import (
     DeleteResult,
     DocumentInfo,
@@ -22,7 +24,7 @@ router = APIRouter()
     status_code=status.HTTP_201_CREATED,
     tags=["Knowledge Base"],
     summary="Upload and ingest a document into the knowledge base",
-    description="Accepts a .txt, .md, or .pdf file, strips traversal sequences, normalizes formatting, segments content into overlapping chunks, generates embeddings, and persists them into Chroma.",
+    description="Accepts a .txt, .md, or .pdf file, strips traversal sequences, normalizes formatting, segments content into overlapping chunks, generates embeddings, and persists them into Chroma and the MongoDB registry.",
     responses={
         400: {
             "description": "Document is empty or contains only whitespace (DOC_EMPTY)."
@@ -39,16 +41,20 @@ router = APIRouter()
         422: {"description": "Request validation error."},
         429: {"description": "Upstream embedding provider rate limit reached."},
         502: {"description": "Embedding provider upstream communication failure."},
+        503: {"description": "Database unavailable (DB_UNAVAILABLE)."},
         504: {"description": "Embedding provider request timed out."},
     },
 )
-async def upload_document(file: UploadFile = File(...)) -> DocumentInfo:
-    """Read upload stream with size cap and delegate ingestion to IngestionService."""
+async def upload_document(
+    file: UploadFile = File(...),
+    repo: DocumentRepo = Depends(get_document_repo),
+) -> DocumentInfo:
+    """Read upload stream with size cap and delegate ingestion to IngestionService with registry."""
     settings = get_settings()
     filename = file.filename or ""
     data = await file.read(settings.rag_max_upload_bytes + 1)
     service = get_ingestion_service()
-    return await service.ingest_document(filename=filename, data=data)
+    return await service.ingest_document(filename=filename, data=data, repo=repo)
 
 
 @router.get(
@@ -56,13 +62,15 @@ async def upload_document(file: UploadFile = File(...)) -> DocumentInfo:
     response_model=DocumentList,
     tags=["Knowledge Base"],
     summary="List all indexed documents in the knowledge base",
-    description="Returns an aggregated listing of all documents stored in Chroma along with chunk counts, character lengths, and cryptographic SHA-256 hashes.",
+    description="Returns an aggregated listing of all documents stored in the MongoDB registry with their chunk counts.",
     status_code=status.HTTP_200_OK,
 )
-async def list_documents() -> DocumentList:
-    """Aggregate indexed chunks by document."""
+async def list_documents(
+    repo: DocumentRepo = Depends(get_document_repo),
+) -> DocumentList:
+    """List documents directly from the MongoDB registry."""
     service = get_ingestion_service()
-    return await service.list_documents()
+    return await service.list_documents(repo=repo)
 
 
 @router.delete(
@@ -70,7 +78,7 @@ async def list_documents() -> DocumentList:
     response_model=DeleteResult,
     tags=["Knowledge Base"],
     summary="Delete a document and all its chunks",
-    description="Permanently deletes a document and all of its associated vector chunks from the persistent Chroma store.",
+    description="Permanently deletes chunks from Chroma first, then removes the registry record.",
     status_code=status.HTTP_200_OK,
     responses={
         404: {
@@ -78,21 +86,23 @@ async def list_documents() -> DocumentList:
         },
     },
 )
-async def delete_document(document_id: str) -> DeleteResult:
-    """Remove all chunks associated with a document_id."""
+async def delete_document(
+    document_id: str,
+    repo: DocumentRepo = Depends(get_document_repo),
+) -> DeleteResult:
+    """Remove chunks from Chroma then remove registry record."""
     service = get_ingestion_service()
-    return await service.delete_document(document_id)
+    return await service.delete_document(document_id, repo=repo)
 
 
-# Architectural Note (Task 2.1):
-# Search is a POST endpoint rather than GET because natural-language queries and
-# document_id filter arrays can be long and must not be exposed in URLs or server access logs.
+# Architectural Note: Search and RAG endpoints do NOT touch MongoDB.
+# They continue operating purely against Chroma and the LLM when MongoDB is down.
 @router.post(
     "/search",
     response_model=SearchResponse,
     tags=["Retrieval"],
     summary="Semantic search over indexed chunks without LLM synthesis",
-    description="Embeds the input query and executes vector similarity search against Chroma, normalizing distance metrics to similarity scores in range [0.0, 1.0].",
+    description="Embeds the input query and executes vector similarity search against Chroma.",
     status_code=status.HTTP_200_OK,
     responses={
         422: {"description": "Validation error on search parameters."},
@@ -102,7 +112,7 @@ async def delete_document(document_id: str) -> DeleteResult:
     },
 )
 async def search_knowledge_base(payload: SearchRequest) -> SearchResponse:
-    """Search the vector store and return relevant chunks with similarity scores."""
+    """Search the vector store directly without touching MongoDB."""
     settings = get_settings()
     effective_top_k = (
         payload.top_k if payload.top_k is not None else settings.rag_top_k_default

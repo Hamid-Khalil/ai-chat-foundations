@@ -1,21 +1,20 @@
 import asyncio
-import logging
+import sys
+from pathlib import Path
+
+# Add project root to sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from app.core.mongo import close_mongo_client, get_database, init_mongo_client
 from app.repositories.indexes import ensure_indexes
-from app.core.mongo import init_mongo_client, close_mongo_client, get_database
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 
-async def main() -> None:
+async def main():
     await init_mongo_client()
     db = get_database()
-    try:
-        await db.command("ping")
-        logger.info("MongoDB ping successful for database '%s'.", db.name)
-        await ensure_indexes(db)
-    finally:
-        await close_mongo_client()
+    await ensure_indexes(db)
+    print("Database initialization and index creation COMPLETE.")
+    await close_mongo_client()
 
 
 if __name__ == "__main__":
