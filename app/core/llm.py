@@ -10,23 +10,17 @@ from app.core.config import get_settings
 
 @lru_cache
 def _build_chat_model(thinking_level: str) -> BaseChatModel:
-    """Build and cache one chat model per thinking level.
-
-    Uses ChatGroq while reading the configured settings (model, API key,
-    max_tokens, timeout, and retries).
-    """
+    """Build and cache one chat model per thinking level."""
     settings = get_settings()
-    api_key = (
-        settings.groq_api_key.get_secret_value()
-        or settings.google_api_key.get_secret_value()
-    )
+
+    api_key = settings.groq_api_key.get_secret_value() if settings.groq_api_key else ""
 
     return ChatGroq(
-        model=settings.gemini_model,
+        model="openai/gpt-oss-20b",
         api_key=api_key,
         max_tokens=settings.gemini_max_tokens,
-        timeout=settings.gemini_timeout_seconds,
-        max_retries=settings.gemini_max_retries,
+        timeout=30.0,
+        max_retries=2,
     )
 
 
